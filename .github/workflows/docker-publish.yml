@@ -29,30 +29,47 @@ jobs:
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
+        id: buildx # Give it an ID to reference its outputs
         uses: docker/setup-buildx-action@v3
-        id: buildx
+
+      - name: Prepare ACR configuration if secrets are set
+        id: prepare_acr
+        run: |
+          if [[ -n "${{ secrets.ACR_LOGIN_SERVER }}" && \
+                -n "${{ secrets.AZURE_CLIENT_ID }}" && \
+                -n "${{ secrets.AZURE_TENANT_ID }}" && \
+                -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ]]; then
+            echo "ACR_ENABLED=true" >> $GITHUB_ENV
+            echo "ACR_IMAGE_FULL_NAME=${{ secrets.ACR_LOGIN_SERVER }}/${{ env.ACR_IMAGE_NAME }}" >> $GITHUB_ENV
+            echo "::notice title=ACR Publishing::ACR configuration found. Will attempt to publish to ${{ secrets.ACR_LOGIN_SERVER }}."
+          else
+            echo "ACR_ENABLED=false" >> $GITHUB_ENV
+            echo "ACR_IMAGE_FULL_NAME=" >> $GITHUB_ENV # Ensure it's empty
+            echo "::notice title=ACR Publishing::ACR_LOGIN_SERVER or other required Azure secrets not fully set. Skipping ACR steps."
+          fi
 
       - name: Login to Docker Hub
+        if: secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Login to Azure Container Registry (ACR)
-        uses: azure/login@v1 # Using OIDC for passwordless auth
+      - name: Login to Azure (OIDC) for ACR
+        if: env.ACR_ENABLED == 'true'
+        uses: azure/login@v1
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-          enable-AzPSSession: false # Not needed for docker login
+          enable-AzPSSession: false
 
       - name: ACR Docker Login
+        if: env.ACR_ENABLED == 'true'
         uses: azure/docker-login@v1
         with:
           login-server: ${{ secrets.ACR_LOGIN_SERVER }}
-          # username: ${{ secrets.AZURE_CLIENT_ID }} # Not needed if azure/login@v1 is used before
-          # password: ${{ secrets.AZURE_CLIENT_SECRET }} # Only if not using OIDC with azure/login
-          logout: false # Keep logged in for subsequent steps
+          logout: false # Keep logged in for push
 
       - name: Docker meta
         id: meta
@@ -60,7 +77,7 @@ jobs:
         with:
           images: |
             ${{ env.DOCKERHUB_IMAGE_NAME }}
-            ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.ACR_IMAGE_NAME }}
+            ${{ env.ACR_IMAGE_FULL_NAME }} # This will be empty if ACR_ENABLED is false; metadata-action ignores empty lines
           tags: |
             type=schedule
             type=ref,event=branch
@@ -69,53 +86,72 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=sha,prefix=sha-
-            latest # Add latest tag for main branch pushes
+            latest
 
       - name: Build and push Docker image with SBOM attestation
         id: build-and-push
         uses: docker/build-push-action@v5
         with:
-          context: . # Assumes Dockerfile is in the root
-          file: ./Dockerfile # Explicit path to Dockerfile
-          push: ${{ github.event_name != 'pull_request' }} # Don't push on PRs
-          tags: ${{ steps.meta.outputs.tags }}
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }} # Tags will include ACR only if ACR_IMAGE_FULL_NAME was set
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Generate SBOM attestation using Docker's sbom generator
-          # This will create an attestation of type "application/vnd.docker.distribution.manifest.v2+json"
-          # with predicateType "https://spdx.dev/Document" or "https://cyclonedx.org/bom"
+          # Generate SBOM attestation
           attests: |
             type=sbom,builder-id=${{ steps.buildx.outputs.name }}
 
-      # Docker Scout Integration
-      # Ensure Docker Scout is enabled for your Docker Hub organization
-      # and that your ACR is connected to Docker Scout if you want ACR image analysis too.
-      - name: Run Docker Scout CVE Analysis
-        if: github.event_name != 'pull_request' # Only run on push, not PRs
+      # --- Docker Scout for Docker Hub Image ---
+      - name: Run Docker Scout CVE Analysis (Docker Hub)
+        if: github.event_name != 'pull_request' && secrets.DOCKERHUB_USERNAME # Only if pushing and DH configured
         uses: docker/scout-action@v1
+        id: scout_dh
         with:
-          command: cves # You can also use 'recommendations', 'image-insights'
-          image: ${{ env.DOCKERHUB_IMAGE_NAME }}:${{ steps.meta.outputs.version }} # Use a specific tag pushed, e.g., the primary version tag
-          # Or use ${{ steps.meta.outputs.tags }} but scout action might not handle multiple tags well for a single image input. Best to pick one primary tag.
-          # To fail the workflow on vulnerabilities (e.g., critical or high):
-          # only-severities: critical,high
-          # exit-code: true
-          sarif-file: scout-results.sarif # Optional: Output results to SARIF for GitHub Security tab integration
-          # To analyze the ACR image as well, you might need a separate step or ensure Scout is configured for your ACR.
-          # For ACR, Scout typically integrates via Microsoft Defender for Cloud.
+          command: cves
+          image: ${{ env.DOCKERHUB_IMAGE_NAME }}:${{ steps.meta.outputs.version }} # Use a specific tag like the semver version
+          # only-severities: critical,high # Uncomment to fail on these
+          # exit-code: true               # Uncomment to fail on these
+          sarif-file: scout-results-dh.sarif
+          continue-on-error: true # So subsequent steps can run (e.g., SARIF upload)
 
-      - name: Upload Scout SARIF results (optional)
-        if: always() && github.event_name != 'pull_request' # always() ensures this runs even if scout fails (unless exit-code:true)
+      - name: Upload Docker Hub Scout SARIF
+        if: always() && github.event_name != 'pull_request' && secrets.DOCKERHUB_USERNAME && steps.scout_dh.outcome == 'success' && steps.scout_dh.outputs.sarif-file
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: scout-results.sarif
-          category: docker-scout # Helps distinguish in Security tab
+          sarif_file: scout-results-dh.sarif
+          category: docker-scout-dh
+
+      # --- Docker Scout for ACR Image (Conditional) ---
+      # Note: Docker Scout's direct CLI support for ACR might require specific setup or rely on Defender for Cloud integration.
+      # This step assumes `docker/scout-action` can analyze the ACR image if it's been pushed and is accessible.
+      # If you use Microsoft Defender for Containers, it scans ACR images automatically.
+      - name: Run Docker Scout CVE Analysis (ACR)
+        if: env.ACR_ENABLED == 'true' && github.event_name != 'pull_request'
+        uses: docker/scout-action@v1
+        id: scout_acr
+        with:
+          command: cves
+          # The image reference should be the fully qualified name pushed to ACR
+          image: ${{ env.ACR_IMAGE_FULL_NAME }}:${{ steps.meta.outputs.version }}
+          # only-severities: critical,high
+          # exit-code: true
+          sarif-file: scout-results-acr.sarif
+          continue-on-error: true
+
+      - name: Upload ACR Scout SARIF
+        if: always() && env.ACR_ENABLED == 'true' && github.event_name != 'pull_request' && steps.scout_acr.outcome == 'success' && steps.scout_acr.outputs.sarif-file
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scout-results-acr.sarif
+          category: docker-scout-acr
 
       - name: Logout from ACR
-        if: always() # Ensure logout even if previous steps fail
+        if: always() && env.ACR_ENABLED == 'true'
         run: docker logout ${{ secrets.ACR_LOGIN_SERVER }}
+        # No explicit azure/logout needed if using azure/login with OIDC for just docker login
 
       - name: Logout from Docker Hub
-        if: always()
+        if: always() && secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN
         run: docker logout
