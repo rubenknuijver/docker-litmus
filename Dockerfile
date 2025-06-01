@@ -4,7 +4,6 @@ LABEL maintainer="Ruben Knuijver <r.knuijver@primecoder.com>"
 ARG VERSION=0.16
 ARG REPO=https://notroj.github.io/litmus/litmus-${VERSION}.tar.gz
 
-ENTRYPOINT ["/usr/local/bin/litmus"]
 
 # Install base packages from the alpine installation
 RUN apk update && \
@@ -51,4 +50,4 @@ RUN apk add --no-cache --virtual .build-deps \
   rm -rf /var/cache/apk/* /tmp/*
 
 WORKDIR /root
-COPY rootfs /
+ENTRYPOINT ["/usr/local/bin/litmus"]
