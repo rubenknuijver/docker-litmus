@@ -49,14 +49,14 @@ jobs:
           fi
 
       - name: Login to Docker Hub
-        if: secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN
+        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Login to Azure (OIDC) for ACR
-        if: env.ACR_ENABLED == 'true'
+        if: ${{ env.ACR_ENABLED == 'true' }}
         uses: azure/login@v1
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -65,7 +65,7 @@ jobs:
           enable-AzPSSession: false
 
       - name: ACR Docker Login
-        if: env.ACR_ENABLED == 'true'
+        if: ${{ env.ACR_ENABLED == 'true' }}
         uses: azure/docker-login@v1
         with:
           login-server: ${{ secrets.ACR_LOGIN_SERVER }}
@@ -105,7 +105,7 @@ jobs:
 
       # --- Docker Scout for Docker Hub Image ---
       - name: Run Docker Scout CVE Analysis (Docker Hub)
-        if: github.event_name != 'pull_request' && secrets.DOCKERHUB_USERNAME # Only if pushing and DH configured
+        if: ${{ github.event_name != 'pull_request' && secrets.DOCKERHUB_USERNAME }} # Only if pushing and DH configured
         uses: docker/scout-action@v1
         id: scout_dh
         with:
@@ -117,7 +117,7 @@ jobs:
           continue-on-error: true # So subsequent steps can run (e.g., SARIF upload)
 
       - name: Upload Docker Hub Scout SARIF
-        if: always() && github.event_name != 'pull_request' && secrets.DOCKERHUB_USERNAME && steps.scout_dh.outcome == 'success' && steps.scout_dh.outputs.sarif-file
+        if: ${{ always() && github.event_name != 'pull_request' && secrets.DOCKERHUB_USERNAME && steps.scout_dh.outcome == 'success' && steps.scout_dh.outputs.sarif-file }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: scout-results-dh.sarif
@@ -128,7 +128,7 @@ jobs:
       # This step assumes `docker/scout-action` can analyze the ACR image if it's been pushed and is accessible.
       # If you use Microsoft Defender for Containers, it scans ACR images automatically.
       - name: Run Docker Scout CVE Analysis (ACR)
-        if: env.ACR_ENABLED == 'true' && github.event_name != 'pull_request'
+        if: ${{ env.ACR_ENABLED == 'true' && github.event_name != 'pull_request' }}
         uses: docker/scout-action@v1
         id: scout_acr
         with:
@@ -141,17 +141,17 @@ jobs:
           continue-on-error: true
 
       - name: Upload ACR Scout SARIF
-        if: always() && env.ACR_ENABLED == 'true' && github.event_name != 'pull_request' && steps.scout_acr.outcome == 'success' && steps.scout_acr.outputs.sarif-file
+        if: ${{ always() && env.ACR_ENABLED == 'true' && github.event_name != 'pull_request' && steps.scout_acr.outcome == 'success' && steps.scout_acr.outputs.sarif-file }}
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: scout-results-acr.sarif
           category: docker-scout-acr
 
       - name: Logout from ACR
-        if: always() && env.ACR_ENABLED == 'true'
+        if: ${{ always() && env.ACR_ENABLED == 'true' }}
         run: docker logout ${{ secrets.ACR_LOGIN_SERVER }}
         # No explicit azure/logout needed if using azure/login with OIDC for just docker login
 
       - name: Logout from Docker Hub
-        if: always() && secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN
+        if: ${{ always() && secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
         run: docker logout
