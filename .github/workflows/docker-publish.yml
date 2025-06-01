@@ -1,0 +1,121 @@
+name: Build and Publish Docker Image
+
+on:
+  push:
+    branches:
+      - main # Or your default branch
+    tags:
+      - 'v*.*.*' # Also trigger on version tags
+  workflow_dispatch: # Allows manual triggering
+
+env:
+  DOCKERHUB_IMAGE_NAME: bcshr/docker-litmus # Replace with your Docker Hub image name
+  ACR_IMAGE_NAME: docker-litmus # Replace with your ACR image name (usually same as repo name)
+
+jobs:
+  build_and_publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read      # To checkout the repository
+      packages: write     # To push to Docker Hub/ACR (though Docker Hub login action manages its own token)
+      id-token: write     # Required for OIDC login to Azure
+      attestations: write # Required for writing attestations (like SBOM)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for multi-platform builds, optional but good practice)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        id: buildx
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to Azure Container Registry (ACR)
+        uses: azure/login@v1 # Using OIDC for passwordless auth
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: false # Not needed for docker login
+
+      - name: ACR Docker Login
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+          # username: ${{ secrets.AZURE_CLIENT_ID }} # Not needed if azure/login@v1 is used before
+          # password: ${{ secrets.AZURE_CLIENT_SECRET }} # Only if not using OIDC with azure/login
+          logout: false # Keep logged in for subsequent steps
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.DOCKERHUB_IMAGE_NAME }}
+            ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.ACR_IMAGE_NAME }}
+          tags: |
+            type=schedule
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+            latest # Add latest tag for main branch pushes
+
+      - name: Build and push Docker image with SBOM attestation
+        id: build-and-push
+        uses: docker/build-push-action@v5
+        with:
+          context: . # Assumes Dockerfile is in the root
+          file: ./Dockerfile # Explicit path to Dockerfile
+          push: ${{ github.event_name != 'pull_request' }} # Don't push on PRs
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Generate SBOM attestation using Docker's sbom generator
+          # This will create an attestation of type "application/vnd.docker.distribution.manifest.v2+json"
+          # with predicateType "https://spdx.dev/Document" or "https://cyclonedx.org/bom"
+          attests: |
+            type=sbom,builder-id=${{ steps.buildx.outputs.name }}
+
+      # Docker Scout Integration
+      # Ensure Docker Scout is enabled for your Docker Hub organization
+      # and that your ACR is connected to Docker Scout if you want ACR image analysis too.
+      - name: Run Docker Scout CVE Analysis
+        if: github.event_name != 'pull_request' # Only run on push, not PRs
+        uses: docker/scout-action@v1
+        with:
+          command: cves # You can also use 'recommendations', 'image-insights'
+          image: ${{ env.DOCKERHUB_IMAGE_NAME }}:${{ steps.meta.outputs.version }} # Use a specific tag pushed, e.g., the primary version tag
+          # Or use ${{ steps.meta.outputs.tags }} but scout action might not handle multiple tags well for a single image input. Best to pick one primary tag.
+          # To fail the workflow on vulnerabilities (e.g., critical or high):
+          # only-severities: critical,high
+          # exit-code: true
+          sarif-file: scout-results.sarif # Optional: Output results to SARIF for GitHub Security tab integration
+          # To analyze the ACR image as well, you might need a separate step or ensure Scout is configured for your ACR.
+          # For ACR, Scout typically integrates via Microsoft Defender for Cloud.
+
+      - name: Upload Scout SARIF results (optional)
+        if: always() && github.event_name != 'pull_request' # always() ensures this runs even if scout fails (unless exit-code:true)
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scout-results.sarif
+          category: docker-scout # Helps distinguish in Security tab
+
+      - name: Logout from ACR
+        if: always() # Ensure logout even if previous steps fail
+        run: docker logout ${{ secrets.ACR_LOGIN_SERVER }}
+
+      - name: Logout from Docker Hub
+        if: always()
+        run: docker logout
