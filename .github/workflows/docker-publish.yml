@@ -75,8 +75,9 @@ jobs:
               uses: docker/metadata-action@v5
               with:
                   images: |
-                      "${{ env.DOCKERHUB_IMAGE_NAME }}"
-                      "${{ env.ACR_IMAGE_FULL_NAME }}" # This will be empty if ACR_ENABLED is false; metadata-action ignores empty lines
+                      ${{ env.DOCKERHUB_IMAGE_NAME }}
+                      ${{ env.ACR_IMAGE_FULL_NAME }}
+                      # This will be empty if ACR_ENABLED is false; metadata-action ignores empty lines
                   tags: |
                       type=schedule
                       type=ref,event=branch
